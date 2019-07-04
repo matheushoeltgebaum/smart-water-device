@@ -5,36 +5,37 @@
 SoftwareSerial mySerial(13, 15);
 
 //Configura as propriedades de calibração do sensor de fluxo.
-//FlowSensorProperties MySensor = {30.0f, 7.5f, {0.74, 0.74, 0.76, 0.76, 0.74, 0.74, 0.71, 0.71, 0.7, 0.7}};
-FlowSensorProperties MySensor = {30.0f, 5.5f, {0.6, 0.6, 0.5, 0.5, 0.6, 0.6, 0.5, 0.5, 0.56, 0.56}};
-//FlowSensorProperties MySensor = {30.0f, 4.5f, {0.45, 0.45, 0.45, 0.45, 0.43, 0.43, 0.43, 0.43, 0.46, 0.46}};
+//FlowSensorProperties MySensor = {30.0f, 5.5f, {0.6, 0.6, 0.5, 0.5, 0.6, 0.6, 0.5, 0.5, 0.56, 0.56}};
+FlowSensorProperties MySensor = {30.0f, 8.8f, {0.9, 0.9, 0.9, 1, 1, 1, 1, 1.05, 1.05, 1.05}};
 FlowMeter Meter = FlowMeter(2, MySensor);
 
 //Variáveis de controle de tempo (rotina do sensor de fluxo)
 long periodFlowRoutine = 1000;   //1 segundo (em milisegundos)
 long lastTimeFlowRoutine = 0;
 
+//Variáveis de controle de tempo (rotina de comunicação Sigfox)
+long periodSigfoxRoutine = 120000; //2 minutos (em milisegundos)
+//long periodSigfoxRoutine = 3600000; //1 hora (em milisegundos)
+long lastTimeSigfoxRoutine = 0;
+
+//Saída do sensor de pressão.
+float pressureSensorVoltage;
+
 //Variável de controle para volume enviado pelo Sigfox.
 int lastVolumeSent = 0;
 
-//Variáveis de controle de tempo (rotina de comunicação Sigfox)
-long periodSigfoxRoutine = 60000; //1 minuto (em milisegundos)
-long lastTimeSigfoxRoutine = 0;
+//Variável que armazena o volume utilizado pela biblioteca (quantidade total gasta).
+float totalVolume = 0.0;
+//Variável que armazena o volume corrigido, com base no sensor de pressão.
+float correctedTotalVolume = 0.0;
 
-float pressureSensorVoltage;
-float pressureSensorValue;
-float pressureSensorValueBars;
+//Variável de volume total acumulado e enviado.
+float accumulatedVolumeSent = 0.0;
 
 //Código executado durante a interrupção realizada pelo sensor de fluxo.
 void MeterISR() {
     //Incrementa a quantidade de pulsos gerados.
-    pressureSensorVoltage = analogRead(0) * 5.00 / 1024;
-    /*pressureSensorValue = (pressureSensorVoltage / 5.0 * 0.75) - 0.1;*/
-    pressureSensorValueBars = ((3.0*((float)pressureSensorVoltage-0.47))*1000000.0) / 10e5;
-
-    if (pressureSensorValueBars >= 0.84) {
-      Meter.count();
-    }
+    Meter.count();
 }
 
 void setup() {
@@ -78,21 +79,53 @@ void flowMeterRoutine(long duration) {
                    "duration: " + String(Meter.getTotalDuration() / 1000) + " s.");
 
     float v = analogRead(0) * 5.00 / 1024;
-    float p = (v / 5.0 * 0.75) - 0.1;
-    float pressure_pascal = (3.0*((float)v-0.47))*1000000.0;
-    float pressure_bar = pressure_pascal/10e5;
 
-    Serial.println("WaterPressure - voltage: " + String(v) + " V, " +
-                   "pressure: " + String(p) + ", " +
-                   "pressure (Pascal): " + String(pressure_pascal) + ", " +
-                   "pressure (Bars): " + String(pressure_bar) + ".");
+    //Calcula quanto foi consumido entre a última iteração e esta iteração.
+    float currentVolume = Meter.getTotalVolume() - totalVolume;
+    totalVolume += currentVolume;
+    
+    //Razão entre o fluxo e a pressão.
+    float ratio = Meter.getCurrentFlowrate() / v;
+    //Calcula o quanto deve alterar do volume atual lido.
+    if (ratio > 0 && ratio < 2.5) {
+      float diff = 2.5 - ratio;
+      float correction = diff / 100;
+      currentVolume += correction - 0.005;
+    }
+    correctedTotalVolume += currentVolume;
+
+    Serial.println("WaterPressure - voltage: " + String(v) + " V.");
+    Serial.println();
+
+    Serial.println("Calculated Volume - total: " + String(totalVolume) + " l " +
+                   "corrected: " + String(correctedTotalVolume) + " l.");
     Serial.println();
 }
 
 //Rotina responsável pela comunicação através do Sigfox.
 void sigfoxRoutine() {
+    int volumeToSend = (correctedTotalVolume - accumulatedVolumeSent) * 100;
+
+    if (checkPreviousResponse() && lastVolumeSent > 0) {
+      volumeToSend -= lastVolumeSent;
+      accumulatedVolumeSent += lastVolumeSent;
+    }
+    
     testConnection();
-    sendMessageRCZ4();
+    sendMessageRCZ4(volumeToSend);
+    lastVolumeSent = volumeToSend;
+}
+
+//Verifica se a última mensagem foi enviada com sucesso.
+bool checkPreviousResponse() {
+  String downlinkResp = getDownlinkRespose();
+    if (downlinkResp.length() == 32) {
+      Serial.println("Enviou com sucesso a mensagem!");
+      return true;
+    } else {
+      Serial.println("Não conseguiu enviar a mensagem!");
+      return false;
+    }
 }
 
 //Testa a conexão.
@@ -101,7 +134,7 @@ void testConnection() {
 }
 
 //Envia mensagem da zona RCZ4
-void sendMessageRCZ4() {
+void sendMessageRCZ4(int volume) {
     String response = serialWriteReturn("AT$GI?\n", "Config RCZ4: ", 100);
     
     //5 caracteres -> x,y\r\n
@@ -114,12 +147,11 @@ void sendMessageRCZ4() {
       }
     }
 
-    int value = (Meter.getTotalVolume() * 100) - lastVolumeSent;
-    lastVolumeSent += value;
-
-    String payload = calculatePayload(value);
+    String payload = calculatePayload(volume);
     Serial.println(payload);
-    serialWrite("AT$SF=" + payload + "\r", "Response: ", 5000);
+  
+    //Deve alterar para um serialWriteReturn
+    serialWrite("AT$SF=" + payload + ",1\r", "Frame Sent", 5000);
 }
 
 //Processa o valor a ser enviado pelo módulo Sigfox.
@@ -183,4 +215,22 @@ String serialWriteReturn(String command, String output, int timeout) {
     delay(500);
   
     return response;
+}
+
+String getDownlinkRespose() {
+  String response = "";
+
+  if (mySerial.available() > 0) {
+    while (mySerial.available() > 0) {
+      Serial.write("\n");
+      char c = mySerial.read();
+      Serial.write(c);
+      response.concat(c);
+    }
+
+    Serial.println("");
+  }
+
+  delay(500);
+  return response;
 }
